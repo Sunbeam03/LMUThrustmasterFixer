@@ -39,6 +39,10 @@ To successfully restore FFB, you must perform these two steps in order:
 
 ## 📦 Installation
 
+* **Download the last release:**
+
+https://github.com/n1kozor/LMUThrustmasterFixer/releases/tag/0.0.1
+
 1.  **Clone or Download** this repository.
 2.  Open a terminal in the folder.
 3.  Install the required dependencies:
