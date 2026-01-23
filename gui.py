@@ -146,7 +146,8 @@ class MainWindow(QMainWindow):
 
     def _execute_reset(self):
         self.update_status("🔄 Resetting USB Driver...")
-        self.reset_worker = ResetWorker()
+        device_id = self.monitor.get_device_id()
+        self.reset_worker = ResetWorker(device_id)
         self.reset_worker.finished.connect(self.on_reset_finished)
         self.reset_worker.start()
 

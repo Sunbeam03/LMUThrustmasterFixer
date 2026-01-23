@@ -44,4 +44,4 @@ To successfully restore FFB, you must perform these two steps in order:
 3.  Install the required dependencies:
 
 ```bash
-pip install PyQt6 pygame
+pip install PyQt6 pygame pyttsx3 pywin32

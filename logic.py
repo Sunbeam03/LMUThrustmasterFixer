@@ -4,9 +4,30 @@ import subprocess
 import configparser
 import os
 import time
-from PyQt6.QtCore import pyqtSignal, QThread, QMutex, QWaitCondition
+import pyttsx3
+import pythoncom
+from PyQt6.QtCore import pyqtSignal, QThread, QMutex
 
 CONFIG_FILE = "settings.ini"
+
+
+# --- SEGÉD OSZTÁLY A HANGHOZ (Külön szálon, hogy ne akassza meg a programot) ---
+class SpeakerThread(QThread):
+    def __init__(self, text):
+        super().__init__()
+        self.text = text
+
+    def run(self):
+        pythoncom.CoInitialize()  # Kötelező Windows alatt szálban
+        try:
+            engine = pyttsx3.init()
+            engine.setProperty('rate', 160)
+            engine.setProperty('volume', 1.0)
+            engine.say(self.text)
+            engine.runAndWait()
+        except:
+            pass
+        pythoncom.CoUninitialize()
 
 
 class ConfigManager:
@@ -33,26 +54,60 @@ class ConfigManager:
         self.bound_button = button_index
 
 
+class DeviceFinder:
+    @staticmethod
+    def get_thrustmaster_id():
+        ps_find = r'''
+        $d = Get-PnpDevice | Where-Object {
+            ($_.FriendlyName -like "*Thrustmaster*" -or
+             $_.FriendlyName -like "*T150*" -or
+             $_.FriendlyName -like "*T300*" -or
+             $_.FriendlyName -like "*TS-PC*" -or
+             $_.FriendlyName -like "*T-GT*") -and 
+             $_.Status -eq "OK"
+        } | Select-Object -First 1
+        if ($d) { Write-Output $d.InstanceId }
+        '''
+        try:
+            result = subprocess.run(
+                ["powershell", "-NoProfile", "-Command", ps_find],
+                capture_output=True, text=True, creationflags=subprocess.CREATE_NO_WINDOW
+            )
+            device_id = result.stdout.strip()
+            return device_id if device_id else None
+        except:
+            return None
+
+
 class ResetWorker(QThread):
     finished = pyqtSignal(str)
 
-    def run(self):
-        # 1. Wait a tiny bit to ensure Pygame has released the handle
-        time.sleep(0.5)
+    def __init__(self, device_id=None):
+        super().__init__()
+        self.device_id = device_id
+        self.speaker = None
 
-        ps_script = r'''
-        $d = Get-PnpDevice | Where-Object {
-            $_.FriendlyName -like "*Thrustmaster*" -or
-            $_.FriendlyName -like "*T150*" -or
-            $_.FriendlyName -like "*T300*" -or
-            $_.FriendlyName -like "*TS-PC*" -or
-            $_.FriendlyName -like "*T-GT*"
-        }
-        if ($d) {
-            Disable-PnpDevice -InstanceId $d.InstanceId -Confirm:$false
-            Start-Sleep -Seconds 1
-            Enable-PnpDevice  -InstanceId $d.InstanceId -Confirm:$false
-        }
+    def run(self):
+        # 1. Csak annyit mondunk: "Resetting..."
+        self.speaker = SpeakerThread("Resetting hardware")
+        self.speaker.start()
+        self.speaker.wait()  # Megvarjuk mig kimondja
+
+        # Fallback ID kereses
+        target_id = self.device_id
+        if not target_id:
+            target_id = DeviceFinder.get_thrustmaster_id()
+
+        if not target_id:
+            self.finished.emit("❌ Error: Wheel not found")
+            return
+
+        # 2. PowerShell Reset
+        time.sleep(0.3)
+        ps_script = f'''
+        Disable-PnpDevice -InstanceId "{target_id}" -Confirm:$false
+        Start-Sleep -Milliseconds 200
+        Enable-PnpDevice  -InstanceId "{target_id}" -Confirm:$false
         '''
         try:
             subprocess.run(
@@ -61,9 +116,10 @@ class ResetWorker(QThread):
                 stderr=subprocess.DEVNULL,
                 creationflags=subprocess.CREATE_NO_WINDOW
             )
-            self.finished.emit("✅ Device Reset Complete")
+            # Itt szándékosan NEM mondunk semmit, majd a Monitor fog, ha visszajött a jel!
+            self.finished.emit("✅ USB Cycle Done. Waiting for signal...")
         except Exception as e:
-            self.finished.emit(f"❌ Reset Failed: {str(e)}")
+            self.finished.emit(f"❌ PowerShell Error: {str(e)}")
 
 
 class JoystickMonitor(QThread):
@@ -80,6 +136,11 @@ class JoystickMonitor(QThread):
         self.joy = None
         self.button_was_pressed = False
         self.mutex = QMutex()
+        self.cached_device_id = None
+
+        # Ez a valtozo jelzi, hogy epp resetbol jovunk vissza
+        self.waiting_for_reconnect = False
+        self.speaker_thread = None
 
     def stop(self):
         self.running = False
@@ -91,32 +152,32 @@ class JoystickMonitor(QThread):
         self.mutex.unlock()
 
     def pause(self):
-        """Releases the joystick handle safely."""
         self.mutex.lock()
         self.paused = True
         self.mutex.unlock()
-        # We wait briefly to ensure the loop cycle finishes
         time.sleep(0.2)
 
     def resume(self):
-        """Re-enables joystick monitoring."""
         self.mutex.lock()
         self.paused = False
+        # Itt allitjuk be, hogy varjuk a reconnect esemenyt
+        self.waiting_for_reconnect = True
         self.mutex.unlock()
 
+    def get_device_id(self):
+        return self.cached_device_id
+
     def _close_joystick(self):
-        """Helper to fully quit pygame joystick subsystem."""
         if pygame.joystick.get_init():
             pygame.joystick.quit()
         self.joy = None
 
     def _init_joystick(self):
-        """Helper to init pygame joystick subsystem."""
         try:
             if not pygame.joystick.get_init():
                 pygame.joystick.init()
             if not pygame.display.get_init():
-                pygame.display.init()  # Sometimes needed for event pumping
+                pygame.display.init()
 
             if pygame.joystick.get_count() > 0:
                 self.joy = pygame.joystick.Joystick(0)
@@ -127,10 +188,11 @@ class JoystickMonitor(QThread):
         return False
 
     def run(self):
-        # Initial Init
         pygame.init()
+        self.cached_device_id = DeviceFinder.get_thrustmaster_id()
+
         if self._init_joystick():
-            self.status_update.emit(f"🎮 Connected: {self.joy.get_name()}")
+            self.status_update.emit(f"🎮 Ready: {self.joy.get_name()}")
         else:
             self.status_update.emit("⚠️ No Wheel Detected")
 
@@ -139,37 +201,48 @@ class JoystickMonitor(QThread):
             is_paused = self.paused
             self.mutex.unlock()
 
-            # --- PAUSED STATE (During Reset) ---
+            # --- PAUSED (Reset alatt) ---
             if is_paused:
-                # If we are paused, we must ensure Pygame is CLOSED
-                # so PowerShell can touch the driver.
                 if pygame.joystick.get_init():
                     self._close_joystick()
-                    self.status_update.emit("⏸️ Monitor Paused (Resetting...)")
-
-                time.sleep(0.5)
+                    self.status_update.emit("⏸️ Waiting for USB...")
+                time.sleep(0.1)
                 continue
 
-            # --- ACTIVE STATE ---
-            # Try to reconnect if joy is None
+            # --- ACTIVE (Figyeles) ---
             if self.joy is None or not pygame.joystick.get_init():
+                # Probalunk csatlakozni
                 if self._init_joystick():
-                    self.status_update.emit(f"🎮 Reconnected: {self.joy.get_name()}")
+                    # !!! SIKERES CSATLAKOZAS !!!
+                    dev_name = self.joy.get_name()
+                    self.status_update.emit(f"🎮 Reconnected: {dev_name}")
+
+                    # Ha resetből jövünk, ITT szólalunk meg
+                    if self.waiting_for_reconnect:
+                        self.waiting_for_reconnect = False  # Reset flag
+
+                        # Kulon szalon inditjuk a beszedet, hogy ne akadjon meg a loop
+                        msg = "Reset Complete. Press FFB Reset in LMU now."
+                        self.speaker_thread = SpeakerThread(msg)
+                        self.speaker_thread.start()
+
+                    # Frissitsuk az ID-t biztonsag kedveert
+                    if not self.cached_device_id:
+                        self.cached_device_id = DeviceFinder.get_thrustmaster_id()
+
                     time.sleep(1)
                 else:
-                    # Keep trying slowly
-                    time.sleep(1)
+                    # Meg nincs kormany
+                    time.sleep(0.5)
                     continue
 
-            # Event Pump
+            # Input Loop
             try:
                 pygame.event.pump()
-            except Exception:
-                # If pump fails, device might be lost
+            except:
                 self._close_joystick()
                 continue
 
-            # --- Binding Logic ---
             if self.binding_mode:
                 for i in range(self.joy.get_numbuttons()):
                     if self.joy.get_button(i):
@@ -180,7 +253,6 @@ class JoystickMonitor(QThread):
                 time.sleep(0.05)
                 continue
 
-            # --- Monitoring Logic ---
             bound_btn = self.config_manager.bound_button
             if bound_btn is not None and bound_btn < self.joy.get_numbuttons():
                 try:
@@ -193,7 +265,6 @@ class JoystickMonitor(QThread):
                     if not pressed:
                         self.button_was_pressed = False
                 except:
-                    # Button read failed
                     self._close_joystick()
 
             time.sleep(0.01)
