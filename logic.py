@@ -11,14 +11,13 @@ from PyQt6.QtCore import pyqtSignal, QThread, QMutex
 CONFIG_FILE = "settings.ini"
 
 
-# --- SEGÉD OSZTÁLY A HANGHOZ (Külön szálon, hogy ne akassza meg a programot) ---
 class SpeakerThread(QThread):
     def __init__(self, text):
         super().__init__()
         self.text = text
 
     def run(self):
-        pythoncom.CoInitialize()  # Kötelező Windows alatt szálban
+        pythoncom.CoInitialize()
         try:
             engine = pyttsx3.init()
             engine.setProperty('rate', 160)
@@ -88,12 +87,10 @@ class ResetWorker(QThread):
         self.speaker = None
 
     def run(self):
-        # 1. Csak annyit mondunk: "Resetting..."
         self.speaker = SpeakerThread("Resetting hardware")
         self.speaker.start()
-        self.speaker.wait()  # Megvarjuk mig kimondja
+        self.speaker.wait()
 
-        # Fallback ID kereses
         target_id = self.device_id
         if not target_id:
             target_id = DeviceFinder.get_thrustmaster_id()
@@ -102,7 +99,6 @@ class ResetWorker(QThread):
             self.finished.emit("❌ Error: Wheel not found")
             return
 
-        # 2. PowerShell Reset
         time.sleep(0.3)
         ps_script = f'''
         Disable-PnpDevice -InstanceId "{target_id}" -Confirm:$false
@@ -116,7 +112,6 @@ class ResetWorker(QThread):
                 stderr=subprocess.DEVNULL,
                 creationflags=subprocess.CREATE_NO_WINDOW
             )
-            # Itt szándékosan NEM mondunk semmit, majd a Monitor fog, ha visszajött a jel!
             self.finished.emit("✅ USB Cycle Done. Waiting for signal...")
         except Exception as e:
             self.finished.emit(f"❌ PowerShell Error: {str(e)}")
@@ -138,7 +133,6 @@ class JoystickMonitor(QThread):
         self.mutex = QMutex()
         self.cached_device_id = None
 
-        # Ez a valtozo jelzi, hogy epp resetbol jovunk vissza
         self.waiting_for_reconnect = False
         self.speaker_thread = None
 
@@ -160,7 +154,7 @@ class JoystickMonitor(QThread):
     def resume(self):
         self.mutex.lock()
         self.paused = False
-        # Itt allitjuk be, hogy varjuk a reconnect esemenyt
+
         self.waiting_for_reconnect = True
         self.mutex.unlock()
 
@@ -201,7 +195,6 @@ class JoystickMonitor(QThread):
             is_paused = self.paused
             self.mutex.unlock()
 
-            # --- PAUSED (Reset alatt) ---
             if is_paused:
                 if pygame.joystick.get_init():
                     self._close_joystick()
@@ -209,30 +202,23 @@ class JoystickMonitor(QThread):
                 time.sleep(0.1)
                 continue
 
-            # --- ACTIVE (Figyeles) ---
             if self.joy is None or not pygame.joystick.get_init():
-                # Probalunk csatlakozni
                 if self._init_joystick():
-                    # !!! SIKERES CSATLAKOZAS !!!
                     dev_name = self.joy.get_name()
                     self.status_update.emit(f"🎮 Reconnected: {dev_name}")
 
-                    # Ha resetből jövünk, ITT szólalunk meg
                     if self.waiting_for_reconnect:
                         self.waiting_for_reconnect = False  # Reset flag
 
-                        # Kulon szalon inditjuk a beszedet, hogy ne akadjon meg a loop
                         msg = "Reset Complete. Press FFB Reset in LMU now."
                         self.speaker_thread = SpeakerThread(msg)
                         self.speaker_thread.start()
 
-                    # Frissitsuk az ID-t biztonsag kedveert
                     if not self.cached_device_id:
                         self.cached_device_id = DeviceFinder.get_thrustmaster_id()
 
                     time.sleep(1)
                 else:
-                    # Meg nincs kormany
                     time.sleep(0.5)
                     continue
 
