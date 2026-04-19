@@ -1,15 +1,274 @@
 # logic.py
-import pygame
 import subprocess
 import configparser
 import os
 import time
 import pyttsx3
 import pythoncom
+import ctypes
 from PyQt6.QtCore import pyqtSignal, QThread, QMutex
 
 CONFIG_FILE = "settings.ini"
 
+# ── Windows API setup ─────────────────────────────────────────────────────────
+hid      = ctypes.WinDLL("hid")
+setupapi = ctypes.WinDLL("setupapi")
+kernel32 = ctypes.WinDLL("kernel32")
+
+# CRITICAL: every function that accepts or returns a HANDLE must declare
+# restype/argtypes as c_void_p. Without this ctypes truncates 64-bit handles
+# to 32-bit, causing silent ERROR_INVALID_HANDLE failures on 64-bit Windows.
+setupapi.SetupDiGetClassDevsW.restype              = ctypes.c_void_p
+setupapi.SetupDiGetClassDevsW.argtypes             = [ctypes.c_void_p, ctypes.c_wchar_p,
+                                                       ctypes.c_void_p, ctypes.c_uint]
+setupapi.SetupDiEnumDeviceInterfaces.argtypes      = [ctypes.c_void_p, ctypes.c_void_p,
+                                                       ctypes.c_void_p, ctypes.c_uint,
+                                                       ctypes.c_void_p]
+setupapi.SetupDiGetDeviceInterfaceDetailW.argtypes = [ctypes.c_void_p, ctypes.c_void_p,
+                                                       ctypes.c_void_p, ctypes.c_uint,
+                                                       ctypes.c_void_p, ctypes.c_void_p]
+setupapi.SetupDiDestroyDeviceInfoList.argtypes     = [ctypes.c_void_p]
+kernel32.CreateFileW.restype                       = ctypes.c_void_p
+kernel32.CloseHandle.argtypes                      = [ctypes.c_void_p]
+kernel32.ReadFile.argtypes                         = [ctypes.c_void_p, ctypes.c_void_p,
+                                                       ctypes.c_uint, ctypes.c_void_p,
+                                                       ctypes.c_void_p]
+hid.HidD_GetHidGuid.argtypes                       = [ctypes.c_void_p]
+hid.HidD_GetAttributes.argtypes                    = [ctypes.c_void_p, ctypes.c_void_p]
+hid.HidD_GetProductString.argtypes                 = [ctypes.c_void_p, ctypes.c_void_p, ctypes.c_uint]
+hid.HidD_GetPreparsedData.argtypes                 = [ctypes.c_void_p, ctypes.c_void_p]
+hid.HidD_FreePreparsedData.argtypes                = [ctypes.c_void_p]
+hid.HidP_GetCaps.argtypes                          = [ctypes.c_void_p, ctypes.c_void_p]
+hid.HidP_GetUsages.argtypes                        = [ctypes.c_uint, ctypes.c_ushort,
+                                                       ctypes.c_ushort, ctypes.c_void_p,
+                                                       ctypes.c_void_p, ctypes.c_void_p,
+                                                       ctypes.c_void_p, ctypes.c_uint]
+
+GENERIC_READ          = 0x80000000
+GENERIC_WRITE         = 0x40000000
+FILE_SHARE_READ       = 0x00000001
+FILE_SHARE_WRITE      = 0x00000002
+OPEN_EXISTING         = 3
+INVALID_HANDLE_VALUE  = ctypes.c_void_p(-1).value
+DIGCF_PRESENT         = 0x02
+DIGCF_DEVICEINTERFACE = 0x10
+THRUSTMASTER_VID      = 0x044F
+CB_SIZE               = 8 if ctypes.sizeof(ctypes.c_void_p) == 8 else 6
+
+# HID Usage Page / Usage for a joystick (used to pick the right interface)
+HID_USAGE_PAGE_GENERIC = 0x01
+HID_USAGE_JOYSTICK     = 0x04
+HID_USAGE_GAMEPAD      = 0x05
+
+# ── ctypes structures ─────────────────────────────────────────────────────────
+
+class GUID(ctypes.Structure):
+    _fields_ = [("Data1", ctypes.c_ulong),
+                ("Data2", ctypes.c_ushort),
+                ("Data3", ctypes.c_ushort),
+                ("Data4", ctypes.c_ubyte * 8)]
+
+class SP_DEVICE_INTERFACE_DATA(ctypes.Structure):
+    _fields_ = [("cbSize",             ctypes.c_uint),
+                ("InterfaceClassGuid", GUID),
+                ("Flags",              ctypes.c_uint),
+                ("Reserved",           ctypes.POINTER(ctypes.c_ulong))]
+
+class SP_DEVICE_INTERFACE_DETAIL_DATA(ctypes.Structure):
+    _fields_ = [("cbSize",     ctypes.c_uint),
+                ("DevicePath", ctypes.c_wchar * 256)]
+
+class HIDD_ATTRIBUTES(ctypes.Structure):
+    _fields_ = [("Size",          ctypes.c_ulong),
+                ("VendorID",      ctypes.c_ushort),
+                ("ProductID",     ctypes.c_ushort),
+                ("VersionNumber", ctypes.c_ushort)]
+
+class HIDP_CAPS(ctypes.Structure):
+    _fields_ = [
+        ("Usage",                     ctypes.c_ushort),
+        ("UsagePage",                 ctypes.c_ushort),
+        ("InputReportByteLength",     ctypes.c_ushort),
+        ("OutputReportByteLength",    ctypes.c_ushort),
+        ("FeatureReportByteLength",   ctypes.c_ushort),
+        ("Reserved",                  ctypes.c_ushort * 17),
+        ("NumberLinkCollectionNodes", ctypes.c_ushort),
+        ("NumberInputButtonCaps",     ctypes.c_ushort),
+        ("NumberInputValueCaps",      ctypes.c_ushort),
+        ("NumberInputDataIndices",    ctypes.c_ushort),
+        ("NumberOutputButtonCaps",    ctypes.c_ushort),
+        ("NumberOutputValueCaps",     ctypes.c_ushort),
+        ("NumberOutputDataIndices",   ctypes.c_ushort),
+        ("NumberFeatureButtonCaps",   ctypes.c_ushort),
+        ("NumberFeatureValueCaps",    ctypes.c_ushort),
+        ("NumberFeatureDataIndices",  ctypes.c_ushort),
+    ]
+
+# ── HID helpers ───────────────────────────────────────────────────────────────
+
+def _open_handle(path):
+    """Try read/write then read-only. Returns handle or None."""
+    handle = kernel32.CreateFileW(
+        path, GENERIC_READ | GENERIC_WRITE,
+        FILE_SHARE_READ | FILE_SHARE_WRITE,
+        None, OPEN_EXISTING, 0, None
+    )
+    if not handle or handle == INVALID_HANDLE_VALUE:
+        handle = kernel32.CreateFileW(
+            path, GENERIC_READ,
+            FILE_SHARE_READ | FILE_SHARE_WRITE,
+            None, OPEN_EXISTING, 0, None
+        )
+    if not handle or handle == INVALID_HANDLE_VALUE:
+        return None
+    return handle
+
+
+def _get_hid_caps(handle):
+    """Returns HIDP_CAPS for an open handle, or None on failure."""
+    preparsed = ctypes.c_void_p()
+    if not hid.HidD_GetPreparsedData(handle, ctypes.byref(preparsed)):
+        return None
+    caps = HIDP_CAPS()
+    hid.HidP_GetCaps(preparsed, ctypes.byref(caps))
+    hid.HidD_FreePreparsedData(preparsed)
+    return caps
+
+
+def find_thrustmaster_devices():
+    """
+    Returns list of (device_path, product_name) for connected Thrustmaster
+    HID interfaces that report as a joystick or gamepad (Usage Page 0x01,
+    Usage 0x04 or 0x05). This filters out sub-collection interfaces that
+    would cause duplicate button events.
+    """
+    guid = GUID()
+    hid.HidD_GetHidGuid(ctypes.byref(guid))
+
+    hdev = setupapi.SetupDiGetClassDevsW(
+        ctypes.byref(guid), None, None, DIGCF_PRESENT | DIGCF_DEVICEINTERFACE
+    )
+    if not hdev or hdev == INVALID_HANDLE_VALUE:
+        return []
+
+    results = []
+    iface = SP_DEVICE_INTERFACE_DATA()
+    iface.cbSize = ctypes.sizeof(SP_DEVICE_INTERFACE_DATA)
+    index = 0
+
+    while setupapi.SetupDiEnumDeviceInterfaces(
+            hdev, None, ctypes.byref(guid), index, ctypes.byref(iface)):
+        index += 1
+
+        detail = SP_DEVICE_INTERFACE_DETAIL_DATA()
+        detail.cbSize = CB_SIZE
+        req = ctypes.c_ulong(0)
+        setupapi.SetupDiGetDeviceInterfaceDetailW(
+            hdev, ctypes.byref(iface),
+            ctypes.byref(detail), ctypes.sizeof(detail),
+            ctypes.byref(req), None
+        )
+
+        handle = _open_handle(detail.DevicePath)
+        if handle is None:
+            continue
+
+        attrs = HIDD_ATTRIBUTES()
+        attrs.Size = ctypes.sizeof(HIDD_ATTRIBUTES)
+        hid.HidD_GetAttributes(handle, ctypes.byref(attrs))
+
+        if attrs.VendorID == THRUSTMASTER_VID:
+            # Only keep the top-level joystick/gamepad interface,
+            # not sub-collections (keyboard, consumer control, etc.)
+            caps = _get_hid_caps(handle)
+            if caps and caps.UsagePage == HID_USAGE_PAGE_GENERIC and \
+               caps.Usage in (HID_USAGE_JOYSTICK, HID_USAGE_GAMEPAD):
+                buf = ctypes.create_unicode_buffer(128)
+                hid.HidD_GetProductString(handle, buf, ctypes.sizeof(buf))
+                results.append((detail.DevicePath, buf.value or "Thrustmaster Device"))
+
+        kernel32.CloseHandle(handle)
+
+    setupapi.SetupDiDestroyDeviceInfoList(hdev)
+    return results
+
+
+# ── ThrustmasterHID ───────────────────────────────────────────────────────────
+
+class ThrustmasterHID:
+    """Opens a Thrustmaster HID joystick interface and reads button states."""
+
+    def __init__(self, path):
+        self.path   = path
+        self.handle = None
+        self.name   = "Thrustmaster Wheel"
+        self._connect()
+
+    def _connect(self):
+        self.handle = _open_handle(self.path)
+        if self.handle:
+            buf = ctypes.create_unicode_buffer(128)
+            hid.HidD_GetProductString(self.handle, buf, ctypes.sizeof(buf))
+            if buf.value:
+                self.name = buf.value
+
+    def close(self):
+        if self.handle:
+            kernel32.CloseHandle(self.handle)
+            self.handle = None
+
+    def is_open(self):
+        return self.handle is not None
+
+    def read_buttons(self):
+        """
+        Reads one HID input report and returns a bitmask of pressed buttons.
+        Blocks until a report arrives. Returns None on device failure.
+        """
+        if not self.is_open():
+            return None
+
+        preparsed = ctypes.c_void_p()
+        if not hid.HidD_GetPreparsedData(self.handle, ctypes.byref(preparsed)):
+            return None
+
+        caps = HIDP_CAPS()
+        hid.HidP_GetCaps(preparsed, ctypes.byref(caps))
+        report_len = caps.InputReportByteLength
+
+        buf        = ctypes.create_string_buffer(report_len)
+        bytes_read = ctypes.c_ulong(0)
+        ok = kernel32.ReadFile(self.handle, buf, report_len, ctypes.byref(bytes_read), None)
+
+        if not ok:
+            hid.HidD_FreePreparsedData(preparsed)
+            return None
+
+        HIDP_INPUT            = 0
+        HID_USAGE_PAGE_BUTTON = 0x09
+        usage_len  = ctypes.c_ulong(128)
+        usages     = (ctypes.c_ushort * 128)()
+
+        ret = hid.HidP_GetUsages(
+            HIDP_INPUT, HID_USAGE_PAGE_BUTTON, 0,
+            usages, ctypes.byref(usage_len),
+            preparsed, buf, bytes_read.value
+        )
+        hid.HidD_FreePreparsedData(preparsed)
+
+        HIDP_STATUS_SUCCESS = 0x00110000
+        if ret != HIDP_STATUS_SUCCESS:
+            return 0  # No buttons pressed — not an error
+
+        bitmask = 0
+        for i in range(usage_len.value):
+            btn = usages[i]
+            if btn > 0:
+                bitmask |= (1 << (btn - 1))  # HID buttons are 1-indexed
+        return bitmask
+
+
+# ── SpeakerThread ─────────────────────────────────────────────────────────────
 
 class SpeakerThread(QThread):
     def __init__(self, text):
@@ -24,10 +283,13 @@ class SpeakerThread(QThread):
             engine.setProperty('volume', 1.0)
             engine.say(self.text)
             engine.runAndWait()
-        except:
+        except Exception:
             pass
-        pythoncom.CoUninitialize()
+        finally:
+            pythoncom.CoUninitialize()
 
+
+# ── ConfigManager ─────────────────────────────────────────────────────────────
 
 class ConfigManager:
     def __init__(self):
@@ -53,16 +315,20 @@ class ConfigManager:
         self.bound_button = button_index
 
 
+# ── DeviceFinder ──────────────────────────────────────────────────────────────
+
 class DeviceFinder:
     @staticmethod
     def get_thrustmaster_id():
         ps_find = r'''
         $d = Get-PnpDevice | Where-Object {
             ($_.FriendlyName -like "*Thrustmaster*" -or
+             $_.FriendlyName -like "*TMX*" -or
              $_.FriendlyName -like "*T150*" -or
              $_.FriendlyName -like "*T300*" -or
              $_.FriendlyName -like "*TS-PC*" -or
-             $_.FriendlyName -like "*T-GT*") -and 
+             $_.FriendlyName -like "*T-GT*" -or
+             ($_.InstanceId -like "USB\VID_044F*")) -and
              $_.Status -eq "OK"
         } | Select-Object -First 1
         if ($d) { Write-Output $d.InstanceId }
@@ -74,9 +340,11 @@ class DeviceFinder:
             )
             device_id = result.stdout.strip()
             return device_id if device_id else None
-        except:
+        except Exception:
             return None
 
+
+# ── ResetWorker ───────────────────────────────────────────────────────────────
 
 class ResetWorker(QThread):
     finished = pyqtSignal(str)
@@ -84,17 +352,13 @@ class ResetWorker(QThread):
     def __init__(self, device_id=None):
         super().__init__()
         self.device_id = device_id
-        self.speaker = None
 
     def run(self):
-        self.speaker = SpeakerThread("Resetting hardware")
-        self.speaker.start()
-        self.speaker.wait()
+        speaker = SpeakerThread("Resetting hardware")
+        speaker.start()
+        speaker.wait()
 
-        target_id = self.device_id
-        if not target_id:
-            target_id = DeviceFinder.get_thrustmaster_id()
-
+        target_id = self.device_id or DeviceFinder.get_thrustmaster_id()
         if not target_id:
             self.finished.emit("❌ Error: Wheel not found")
             return
@@ -117,27 +381,31 @@ class ResetWorker(QThread):
             self.finished.emit(f"❌ PowerShell Error: {str(e)}")
 
 
+# ── JoystickMonitor ───────────────────────────────────────────────────────────
+
 class JoystickMonitor(QThread):
-    status_update = pyqtSignal(str)
+    status_update    = pyqtSignal(str)
     button_triggered = pyqtSignal()
     binding_complete = pyqtSignal(int)
 
     def __init__(self, config_manager):
         super().__init__()
-        self.config_manager = config_manager
-        self.running = True
-        self.paused = False
-        self.binding_mode = False
-        self.joy = None
-        self.button_was_pressed = False
-        self.mutex = QMutex()
-        self.cached_device_id = None
-
+        self.config_manager        = config_manager
+        self.running               = True
+        self.paused                = False
+        self.binding_mode          = False
+        self.button_was_pressed    = False
+        self.mutex                 = QMutex()
+        self.cached_device_id      = None
         self.waiting_for_reconnect = False
-        self.speaker_thread = None
+        self.speaker_thread        = None
+        self.device                = None
 
     def stop(self):
+        """Signal the thread to stop and unblock any pending ReadFile by closing the handle."""
         self.running = False
+        if self.device:
+            self.device.close()
         self.wait()
 
     def set_binding_mode(self, active: bool):
@@ -146,47 +414,42 @@ class JoystickMonitor(QThread):
         self.mutex.unlock()
 
     def pause(self):
+        """
+        Called from the GUI thread before a USB reset.
+        Just sets the flag and closes the handle — does NOT sleep or block.
+        The monitor thread will notice is_open()==False and stop reading on its own.
+        """
         self.mutex.lock()
         self.paused = True
         self.mutex.unlock()
-        time.sleep(0.2)
+        if self.device:
+            self.device.close()
 
     def resume(self):
         self.mutex.lock()
         self.paused = False
-
         self.waiting_for_reconnect = True
         self.mutex.unlock()
 
     def get_device_id(self):
         return self.cached_device_id
 
-    def _close_joystick(self):
-        if pygame.joystick.get_init():
-            pygame.joystick.quit()
-        self.joy = None
-
-    def _init_joystick(self):
-        try:
-            if not pygame.joystick.get_init():
-                pygame.joystick.init()
-            if not pygame.display.get_init():
-                pygame.display.init()
-
-            if pygame.joystick.get_count() > 0:
-                self.joy = pygame.joystick.Joystick(0)
-                self.joy.init()
-                return True
-        except Exception:
-            pass
+    def _try_connect(self):
+        devices = find_thrustmaster_devices()
+        if not devices:
+            return False
+        path, _ = devices[0]
+        self.device = ThrustmasterHID(path)
+        if self.device.is_open():
+            return True
+        self.device = None
         return False
 
     def run(self):
-        pygame.init()
         self.cached_device_id = DeviceFinder.get_thrustmaster_id()
 
-        if self._init_joystick():
-            self.status_update.emit(f"🎮 Ready: {self.joy.get_name()}")
+        if self._try_connect():
+            self.status_update.emit(f"🎮 Ready: {self.device.name}")
         else:
             self.status_update.emit("⚠️ No Wheel Detected")
 
@@ -196,63 +459,54 @@ class JoystickMonitor(QThread):
             self.mutex.unlock()
 
             if is_paused:
-                if pygame.joystick.get_init():
-                    self._close_joystick()
-                    self.status_update.emit("⏸️ Waiting for USB...")
+                # Emit once then just sleep — don't spam the status label
                 time.sleep(0.1)
                 continue
 
-            if self.joy is None or not pygame.joystick.get_init():
-                if self._init_joystick():
-                    dev_name = self.joy.get_name()
-                    self.status_update.emit(f"🎮 Reconnected: {dev_name}")
-
+            # Reconnect if needed
+            if self.device is None or not self.device.is_open():
+                if self._try_connect():
+                    self.status_update.emit(f"🎮 Reconnected: {self.device.name}")
                     if self.waiting_for_reconnect:
-                        self.waiting_for_reconnect = False  # Reset flag
-
-                        msg = "Reset Complete. Press FFB Reset in LMU now."
-                        self.speaker_thread = SpeakerThread(msg)
+                        self.waiting_for_reconnect = False
+                        if not self.cached_device_id:
+                            self.cached_device_id = DeviceFinder.get_thrustmaster_id()
+                        self.speaker_thread = SpeakerThread(
+                            "Reset Complete. Press FFB Reset in LMU now.")
                         self.speaker_thread.start()
-
-                    if not self.cached_device_id:
-                        self.cached_device_id = DeviceFinder.get_thrustmaster_id()
-
                     time.sleep(1)
                 else:
                     time.sleep(0.5)
-                    continue
-
-            # Input Loop
-            try:
-                pygame.event.pump()
-            except:
-                self._close_joystick()
                 continue
 
-            if self.binding_mode:
-                for i in range(self.joy.get_numbuttons()):
-                    if self.joy.get_button(i):
-                        self.config_manager.save(i)
-                        self.binding_complete.emit(i)
-                        self.set_binding_mode(False)
-                        break
-                time.sleep(0.05)
+            # read_buttons() blocks until a report arrives or the handle is closed
+            buttons = self.device.read_buttons()
+
+            if buttons is None:
+                # Handle was closed (pause/stop) or device disconnected
+                if not self.paused:
+                    self.device = None
+                    self.status_update.emit("⚠️ No Wheel Detected")
+                    time.sleep(0.5)
+                continue
+
+            self.mutex.lock()
+            in_binding = self.binding_mode
+            self.mutex.unlock()
+
+            if in_binding:
+                if buttons != 0:
+                    btn_index = (buttons & -buttons).bit_length() - 1
+                    self.config_manager.save(btn_index)
+                    self.binding_complete.emit(btn_index)
+                    self.set_binding_mode(False)
                 continue
 
             bound_btn = self.config_manager.bound_button
-            if bound_btn is not None and bound_btn < self.joy.get_numbuttons():
-                try:
-                    pressed = self.joy.get_button(bound_btn)
-
-                    if pressed and not self.button_was_pressed:
-                        self.button_triggered.emit()
-                        self.button_was_pressed = True
-
-                    if not pressed:
-                        self.button_was_pressed = False
-                except:
-                    self._close_joystick()
-
-            time.sleep(0.01)
-
-        pygame.quit()
+            if bound_btn is not None:
+                pressed = bool(buttons & (1 << bound_btn))
+                if pressed and not self.button_was_pressed:
+                    self.button_triggered.emit()
+                    self.button_was_pressed = True
+                if not pressed:
+                    self.button_was_pressed = False

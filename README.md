@@ -48,4 +48,17 @@ https://github.com/n1kozor/LMUThrustmasterFixer/releases/tag/0.0.1
 3.  Install the required dependencies:
 
 ```bash
-pip install PyQt6 pygame pyttsx3 pywin32
+pip install PyQt6 pyttsx3 pywin32
+
+## Running the App
+1. Open a terminal and run "python main.py"
+
+OR
+
+1. Double click "LaunchTMResetter.bat"
+
+OR
+
+1. Right Click Le Mans Ultimate in Steam
+2. Choose Properties
+3. Under "General" add the following command to the Advanced Launch Options: cmd /c ""C:\YOUR\PATH\TO\THE\BAT\LaunchTMRestarter.bat" & start "" %command%""

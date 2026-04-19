@@ -1,17 +1,16 @@
 # main.py
 import sys
 import ctypes
-import os
 from PyQt6.QtWidgets import QApplication
 from gui import MainWindow
 from styles import DARK_THEME
 
 
 def is_admin():
-    """Checks if the script has administrator privileges."""
+    # """Checks if the script has administrator privileges."""
     try:
         return ctypes.windll.shell32.IsUserAnAdmin()
-    except:
+    except Exception:
         return False
 
 
