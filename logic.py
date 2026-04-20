@@ -33,6 +33,16 @@ kernel32.CloseHandle.argtypes                      = [ctypes.c_void_p]
 kernel32.ReadFile.argtypes                         = [ctypes.c_void_p, ctypes.c_void_p,
                                                        ctypes.c_uint, ctypes.c_void_p,
                                                        ctypes.c_void_p]
+kernel32.CreateEventW.restype                      = ctypes.c_void_p
+kernel32.CreateEventW.argtypes                     = [ctypes.c_void_p, ctypes.c_bool,
+                                                       ctypes.c_bool, ctypes.c_wchar_p]
+kernel32.WaitForSingleObject.restype               = ctypes.c_uint
+kernel32.WaitForSingleObject.argtypes              = [ctypes.c_void_p, ctypes.c_uint]
+kernel32.GetOverlappedResult.restype               = ctypes.c_bool
+kernel32.GetOverlappedResult.argtypes              = [ctypes.c_void_p, ctypes.c_void_p,
+                                                       ctypes.c_void_p, ctypes.c_bool]
+kernel32.ResetEvent.argtypes                       = [ctypes.c_void_p]
+kernel32.CancelIo.argtypes                         = [ctypes.c_void_p]
 hid.HidD_GetHidGuid.argtypes                       = [ctypes.c_void_p]
 hid.HidD_GetAttributes.argtypes                    = [ctypes.c_void_p, ctypes.c_void_p]
 hid.HidD_GetProductString.argtypes                 = [ctypes.c_void_p, ctypes.c_void_p, ctypes.c_uint]
@@ -48,6 +58,10 @@ GENERIC_READ          = 0x80000000
 GENERIC_WRITE         = 0x40000000
 FILE_SHARE_READ       = 0x00000001
 FILE_SHARE_WRITE      = 0x00000002
+FILE_FLAG_OVERLAPPED  = 0x40000000
+WAIT_OBJECT_0         = 0x00000000
+WAIT_TIMEOUT          = 0x00000102
+ERROR_IO_PENDING      = 997
 OPEN_EXISTING         = 3
 INVALID_HANDLE_VALUE  = ctypes.c_void_p(-1).value
 DIGCF_PRESENT         = 0x02
@@ -59,6 +73,16 @@ CB_SIZE               = 8 if ctypes.sizeof(ctypes.c_void_p) == 8 else 6
 HID_USAGE_PAGE_GENERIC = 0x01
 HID_USAGE_JOYSTICK     = 0x04
 HID_USAGE_GAMEPAD      = 0x05
+
+class OVERLAPPED(ctypes.Structure):
+    class _U(ctypes.Union):
+        class _S(ctypes.Structure):
+            _fields_ = [("Offset", ctypes.c_uint), ("OffsetHigh", ctypes.c_uint)]
+        _fields_ = [("s", _S), ("Pointer", ctypes.c_void_p)]
+    _fields_ = [("Internal",     ctypes.c_void_p),
+                ("InternalHigh", ctypes.c_void_p),
+                ("u",            _U),
+                ("hEvent",       ctypes.c_void_p)]
 
 # ── ctypes structures ─────────────────────────────────────────────────────────
 
@@ -106,18 +130,19 @@ class HIDP_CAPS(ctypes.Structure):
 
 # ── HID helpers ───────────────────────────────────────────────────────────────
 
-def _open_handle(path):
+def _open_handle(path, overlapped=False):
     """Try read/write then read-only. Returns handle or None."""
+    flags = FILE_FLAG_OVERLAPPED if overlapped else 0
     handle = kernel32.CreateFileW(
         path, GENERIC_READ | GENERIC_WRITE,
         FILE_SHARE_READ | FILE_SHARE_WRITE,
-        None, OPEN_EXISTING, 0, None
+        None, OPEN_EXISTING, flags, None
     )
     if not handle or handle == INVALID_HANDLE_VALUE:
         handle = kernel32.CreateFileW(
             path, GENERIC_READ,
             FILE_SHARE_READ | FILE_SHARE_WRITE,
-            None, OPEN_EXISTING, 0, None
+            None, OPEN_EXISTING, flags, None
         )
     if not handle or handle == INVALID_HANDLE_VALUE:
         return None
@@ -196,75 +221,121 @@ def find_thrustmaster_devices():
 # ── ThrustmasterHID ───────────────────────────────────────────────────────────
 
 class ThrustmasterHID:
-    """Opens a Thrustmaster HID joystick interface and reads button states."""
+    """
+    Opens a Thrustmaster HID joystick interface with FILE_FLAG_OVERLAPPED so
+    that read_buttons() can time out and return None instead of blocking forever.
+    This allows the monitor thread to check self.running and exit cleanly.
+    """
 
     def __init__(self, path):
-        self.path   = path
-        self.handle = None
-        self.name   = "Thrustmaster Wheel"
+        self.path      = path
+        self.handle    = None
+        self.event     = None   # manual-reset event for OVERLAPPED reads
+        self.name      = "Thrustmaster Wheel"
+        self.preparsed = None
+        self.report_len = 0
         self._connect()
 
     def _connect(self):
-        self.handle = _open_handle(self.path)
-        if self.handle:
-            buf = ctypes.create_unicode_buffer(128)
-            hid.HidD_GetProductString(self.handle, buf, ctypes.sizeof(buf))
-            if buf.value:
-                self.name = buf.value
+        # Open with FILE_FLAG_OVERLAPPED so ReadFile never blocks permanently
+        self.handle = _open_handle(self.path, overlapped=True)
+        if not self.handle:
+            return
+
+        # Create a manual-reset event for overlapped I/O
+        self.event = kernel32.CreateEventW(None, True, False, None)
+        if not self.event:
+            self.close()
+            return
+
+        # Cache preparsed data and report length up front
+        preparsed = ctypes.c_void_p()
+        if hid.HidD_GetPreparsedData(self.handle, ctypes.byref(preparsed)):
+            caps = HIDP_CAPS()
+            hid.HidP_GetCaps(preparsed, ctypes.byref(caps))
+            self.report_len = caps.InputReportByteLength
+            self.preparsed  = preparsed
+        else:
+            self.close()
+            return
+
+        buf = ctypes.create_unicode_buffer(128)
+        hid.HidD_GetProductString(self.handle, buf, ctypes.sizeof(buf))
+        if buf.value:
+            self.name = buf.value
 
     def close(self):
         if self.handle:
+            kernel32.CancelIo(self.handle)
             kernel32.CloseHandle(self.handle)
             self.handle = None
+        if self.event:
+            kernel32.CloseHandle(self.event)
+            self.event = None
+        if self.preparsed:
+            hid.HidD_FreePreparsedData(self.preparsed)
+            self.preparsed = None
 
     def is_open(self):
         return self.handle is not None
 
-    def read_buttons(self):
+    def read_buttons(self, timeout_ms=200):
         """
-        Reads one HID input report and returns a bitmask of pressed buttons.
-        Blocks until a report arrives. Returns None on device failure.
+        Reads one HID input report using overlapped I/O with a timeout.
+        Returns a button bitmask, 0 if no buttons pressed, or None on failure.
+        Returning None means the device is gone or the handle was closed.
         """
         if not self.is_open():
             return None
 
-        preparsed = ctypes.c_void_p()
-        if not hid.HidD_GetPreparsedData(self.handle, ctypes.byref(preparsed)):
+        buf       = ctypes.create_string_buffer(self.report_len)
+        ov        = OVERLAPPED()
+        ov.hEvent = self.event
+        kernel32.ResetEvent(self.event)
+
+        bytes_read = ctypes.c_ulong(0)
+        ok = kernel32.ReadFile(self.handle, buf, self.report_len, None, ctypes.byref(ov))
+        err = ctypes.GetLastError()
+
+        if not ok and err != ERROR_IO_PENDING:
+            # Real error — device gone
             return None
 
-        caps = HIDP_CAPS()
-        hid.HidP_GetCaps(preparsed, ctypes.byref(caps))
-        report_len = caps.InputReportByteLength
+        # Wait up to timeout_ms for data to arrive
+        wait = kernel32.WaitForSingleObject(self.event, timeout_ms)
 
-        buf        = ctypes.create_string_buffer(report_len)
-        bytes_read = ctypes.c_ulong(0)
-        ok = kernel32.ReadFile(self.handle, buf, report_len, ctypes.byref(bytes_read), None)
+        if wait == WAIT_TIMEOUT:
+            # No data yet — cancel and return empty (not an error)
+            kernel32.CancelIo(self.handle)
+            return 0
 
-        if not ok:
-            hid.HidD_FreePreparsedData(preparsed)
+        if wait != WAIT_OBJECT_0:
+            return None
+
+        if not kernel32.GetOverlappedResult(self.handle, ctypes.byref(ov),
+                                             ctypes.byref(bytes_read), False):
             return None
 
         HIDP_INPUT            = 0
         HID_USAGE_PAGE_BUTTON = 0x09
-        usage_len  = ctypes.c_ulong(128)
-        usages     = (ctypes.c_ushort * 128)()
+        usage_len = ctypes.c_ulong(128)
+        usages    = (ctypes.c_ushort * 128)()
 
         ret = hid.HidP_GetUsages(
             HIDP_INPUT, HID_USAGE_PAGE_BUTTON, 0,
             usages, ctypes.byref(usage_len),
-            preparsed, buf, bytes_read.value
+            self.preparsed, buf, bytes_read.value
         )
-        hid.HidD_FreePreparsedData(preparsed)
 
         HIDP_STATUS_SUCCESS = 0x00110000
         if ret != HIDP_STATUS_SUCCESS:
-            return 0  # No buttons pressed — not an error
+            return 0
 
         bitmask = 0
         for i in range(usage_len.value):
             btn = usages[i]
             if btn > 0:
-                bitmask |= (1 << (btn - 1))  # HID buttons are 1-indexed
+                bitmask |= (1 << (btn - 1))
         return bitmask
 
 
